@@ -9,3 +9,5 @@ log/
 regression.diffs
 regression.out
 *.bc
+prompt-exports/
+docs/evidence/

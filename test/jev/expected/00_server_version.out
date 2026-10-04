@@ -1,0 +1,46 @@
+CREATE EXTENSION IF NOT EXISTS typesafe;
+SELECT current_setting('server_version') AS server_version;
+ server_version 
+----------------
+ 18.4
+(1 row)
+
+\set ECHO none
+SELECT jev_version();
+ jev_version 
+-------------
+ 0.2.0
+(1 row)
+
+SELECT extversion FROM pg_extension WHERE extname = 'typesafe';
+ extversion 
+------------
+ 0.1.0
+(1 row)
+
+SELECT p.proname,
+       pg_get_function_result(p.oid) AS result,
+       l.lanname,
+       p.provolatile,
+       p.proparallel,
+       p.proisstrict,
+       p.prosecdef
+FROM pg_proc p
+JOIN pg_language l ON l.oid = p.prolang
+JOIN pg_extension e ON p.pronamespace = e.extnamespace AND e.extname = 'typesafe'
+WHERE p.proname = 'jev' OR p.proname LIKE 'jev\_%'
+ORDER BY 1, pg_get_function_identity_arguments(p.oid);
+     proname     |      result      | lanname | provolatile | proparallel | proisstrict | prosecdef 
+-----------------+------------------+---------+-------------+-------------+-------------+-----------
+ jev             | boolean          | c       | s           | u           | f           | f
+ jev_cache_clear | void             | c       | v           | u           | f           | f
+ jev_choice      | text             | c       | s           | u           | f           | f
+ jev_confidence  | double precision | c       | s           | u           | f           | f
+ jev_eval        | jsonb            | c       | s           | u           | f           | f
+ jev_prob        | double precision | c       | s           | u           | f           | f
+ jev_score       | double precision | c       | s           | u           | f           | f
+ jev_score_norm  | double precision | c       | s           | u           | f           | f
+ jev_stats       | jsonb            | c       | s           | u           | f           | f
+ jev_version     | text             | c       | i           | u           | f           | f
+(10 rows)
+

@@ -1,7 +1,8 @@
 # PostgreSQL with pg_typesafe preinstalled and enabled.
 #
+#   docker build --build-arg PG_MAJOR=17 -t pg_typesafe:17 .
 #   docker run -e POSTGRES_PASSWORD=pw -e TYPESAFE_API_KEY=tsk_... \
-#     -p 5432:5432 ghcr.io/giuliosmall/pg_typesafe:17
+#     -p 5432:5432 pg_typesafe:17
 #
 # Build another major:  docker build --build-arg PG_MAJOR=16 .
 ARG PG_MAJOR=17
@@ -14,7 +15,7 @@ RUN apt-get update \
       postgresql-server-dev-${PG_MAJOR} libcurl4-openssl-dev pkg-config gcc make \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY Makefile typesafe.c typesafe.control typesafe--*.sql ./
+COPY Makefile typesafe*.c typesafe*.h typesafe.control typesafe--*.sql ./
 RUN make with_llvm=no \
  && make with_llvm=no DESTDIR=/out install
 
@@ -26,6 +27,6 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/ /
 COPY docker/initdb-typesafe.sh /docker-entrypoint-initdb.d/10-typesafe.sh
-LABEL org.opencontainers.image.source="https://github.com/giuliosmall/pg_typesafe" \
+LABEL org.opencontainers.image.source="https://github.com/wuxianliang/pg_typesafe" \
       org.opencontainers.image.description="PostgreSQL with the pg_typesafe extension (TypeSafe AI from SQL)" \
       org.opencontainers.image.licenses="MIT"

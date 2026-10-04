@@ -1,7 +1,7 @@
 #!/bin/sh
 # pg_typesafe installer
 #
-#   curl -fsSL https://raw.githubusercontent.com/giuliosmall/pg_typesafe/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/wuxianliang/pg_typesafe/main/install.sh | sh
 #
 # Finds every PostgreSQL 15+ server on this machine, installs a prebuilt
 # binary for it (Linux glibc, x86_64/aarch64) or builds from source
@@ -23,7 +23,7 @@
 # variables (PGHOST, PGPORT, PGUSER) for --db.
 set -eu
 
-REPO="giuliosmall/pg_typesafe"
+REPO="wuxianliang/pg_typesafe"
 MIN_MAJOR=15
 
 DB="${TYPESAFE_DB:-}"
@@ -199,7 +199,7 @@ if [ -z "$TARGETS" ]; then
 	die "no PostgreSQL $MIN_MAJOR+ server found.
   Install PostgreSQL first, pass --pg-config /path/to/pg_config, or skip the
   install entirely with Docker:
-    docker run -e POSTGRES_PASSWORD=pw -e TYPESAFE_API_KEY=tsk_... ghcr.io/$REPO:17"
+	git clone https://github.com/$REPO.git && docker build -t pg_typesafe:17 ."
 fi
 
 # --- prebuilt binaries ----------------------------------------------------

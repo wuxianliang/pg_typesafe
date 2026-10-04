@@ -2,16 +2,16 @@
    "name": "typesafe",
    "abstract": "Call TypeSafe AI (Choice, Noul, Score) from SQL for categorical classification",
    "description": "A PostgreSQL extension that classifies, detects, and scores text with TypeSafe AI System One (Jev) from SQL, with batched set-returning variants that turn thousands of rows into a handful of HTTP requests.",
-   "version": "0.0.1",
-   "maintainer": "Giulio Piccolo",
+   "version": "0.1.0",
+   "maintainer": "Xianliang Wu",
    "license": "mit",
    "release_status": "unstable",
    "provides": {
       "typesafe": {
          "abstract": "TypeSafe AI client for categorical classification",
-         "file": "typesafe--0.0.1.sql",
+         "file": "typesafe--0.1.0.sql",
          "docfile": "README.md",
-         "version": "0.0.1"
+         "version": "0.1.0"
       }
    },
    "prereqs": {
@@ -22,13 +22,13 @@
       }
    },
    "resources": {
-      "homepage": "https://github.com/giuliosmall/pg_typesafe",
+      "homepage": "https://github.com/wuxianliang/pg_typesafe",
       "bugtracker": {
-         "web": "https://github.com/giuliosmall/pg_typesafe/issues"
+         "web": "https://github.com/wuxianliang/pg_typesafe/issues"
       },
       "repository": {
-         "url": "https://github.com/giuliosmall/pg_typesafe.git",
-         "web": "https://github.com/giuliosmall/pg_typesafe",
+         "url": "https://github.com/wuxianliang/pg_typesafe.git",
+         "web": "https://github.com/wuxianliang/pg_typesafe",
          "type": "git"
       }
    },

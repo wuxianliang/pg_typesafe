@@ -134,6 +134,21 @@ like($stderr, qr/Timeout|timed out/i, 'stall surfaces as timeout');
 isnt($ret, 0, 'non-local http endpoint fails');
 like($stderr, qr/must use https/, 'endpoint policy error is clear');
 
+($ret, $stdout, $stderr) = $node->psql('postgres',
+	"SET typesafe.api_key = 'test-key';\n"
+	. "SET typesafe.endpoint = 'http://127.0.0.1.example/';\n"
+	. "SET typesafe.mock_response = '';\n"
+	. "SELECT typesafe_noul('x', 'urgent?');");
+isnt($ret, 0, 'http host-prefix trick fails');
+like($stderr, qr/must use https|not a valid URL/, 'host-prefix trick rejected');
+
+($ret, $stdout, $stderr) = $node->psql('postgres',
+	"SET typesafe.api_key = 'test-key';\n"
+	. "SET typesafe.endpoint = 'http://user:pw\@127.0.0.1:$port/';\n"
+	. "SET typesafe.mock_response = '';\n"
+	. "SELECT typesafe_noul('x', 'urgent?');");
+isnt($ret, 0, 'http userinfo is rejected');
+
 $node->stop;
 done_testing();
 

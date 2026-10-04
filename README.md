@@ -1,10 +1,12 @@
 # pg_typesafe
 
-[![ci](https://github.com/giuliosmall/pg_typesafe/actions/workflows/ci.yml/badge.svg)](https://github.com/giuliosmall/pg_typesafe/actions/workflows/ci.yml)
+[![ci](https://github.com/wuxianliang/pg_typesafe/actions/workflows/ci.yml/badge.svg)](https://github.com/wuxianliang/pg_typesafe/actions/workflows/ci.yml)
 [![PGXN version](https://badge.fury.io/pg/typesafe.svg)](https://pgxn.org/dist/typesafe/)
-[![release](https://img.shields.io/github/v/release/giuliosmall/pg_typesafe)](https://github.com/giuliosmall/pg_typesafe/releases/latest)
+[![release](https://img.shields.io/github/v/release/wuxianliang/pg_typesafe)](https://github.com/wuxianliang/pg_typesafe/releases/latest)
 
-**Pre-alpha.** A PostgreSQL extension that calls [TypeSafe AI](https://console.typesafe.ai/home) (System One / Jev) from SQL for categorical work: Choice, Noul, and Score.
+**0.1.0.** A PostgreSQL extension that calls [TypeSafe AI](https://console.typesafe.ai/home) (System One / Jev) from SQL. It keeps the original `typesafe_*` text classifiers and adds native `jev_*` row predicates (pg-jev 0.2.0 API).
+
+Maintained at [wuxianliang/pg_typesafe](https://github.com/wuxianliang/pg_typesafe). Based on [giuliosmall/pg_typesafe](https://github.com/giuliosmall/pg_typesafe); this is not the upstream project.
 
 Not affiliated with TypeSafe AI or the PostgreSQL Global Development Group.
 
@@ -15,7 +17,7 @@ Supports **PostgreSQL 15, 16, 17 and 18** on Linux and macOS, libcurl 7.61+.
 ### One line
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/giuliosmall/pg_typesafe/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/wuxianliang/pg_typesafe/main/install.sh | sh
 ```
 
 The installer finds every PostgreSQL 15+ server on the machine, installs a
@@ -28,7 +30,7 @@ Install, enable in a database, and hand the server your API key in one step,
 with no restart:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/giuliosmall/pg_typesafe/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/wuxianliang/pg_typesafe/main/install.sh \
   | sudo TYPESAFE_API_KEY=tsk_... sh -s -- --db mydb
 ```
 
@@ -48,23 +50,27 @@ text or logs), written to `typesafe.key` in the data directory, and
 ### Docker
 
 ```bash
+docker build --build-arg PG_MAJOR=17 -t pg_typesafe:17 .
 docker run -d -p 5432:5432 \
   -e POSTGRES_PASSWORD=pw \
   -e TYPESAFE_API_KEY=tsk_... \
-  ghcr.io/giuliosmall/pg_typesafe:17
+  pg_typesafe:17
 ```
 
 The official `postgres` image with the extension preinstalled and already
-created in `POSTGRES_DB` and `template1` (so every new database has it). Tags:
-`15`, `16`, `17`, `18`, `latest` (= 17), and `<major>-<version>`; amd64 and
-arm64. To keep the key out of `docker inspect`, mount it as a secret and set
+created in `POSTGRES_DB` and `template1` (so every new database has it). Build
+`PG_MAJOR` 15, 16, 17, or 18. To keep the key out of `docker inspect`, mount it as a secret and set
 `TYPESAFE_API_KEY_FILE=/run/secrets/typesafe_key` instead.
 
 ```yaml
 # compose.yaml
 services:
   db:
-    image: ghcr.io/giuliosmall/pg_typesafe:17
+    image: pg_typesafe:17
+    build:
+      context: .
+      args:
+        PG_MAJOR: "17"
     environment:
       POSTGRES_PASSWORD: pw
       TYPESAFE_API_KEY_FILE: /run/secrets/typesafe_key
@@ -88,7 +94,7 @@ Listing: [pgxn.org/dist/typesafe](https://pgxn.org/dist/typesafe/).
 ### From source
 
 ```bash
-git clone https://github.com/giuliosmall/pg_typesafe.git
+git clone https://github.com/wuxianliang/pg_typesafe.git
 cd pg_typesafe
 make
 make install   # needs write access to pkglibdir (often sudo)
@@ -100,14 +106,19 @@ Needs the PostgreSQL server headers (`postgresql-server-dev-<major>` /
 ### Enable
 
 ```sql
-CREATE EXTENSION typesafe;
+CREATE EXTENSION typesafe;          -- 0.1.0: typesafe_* and jev_*
+-- ALTER EXTENSION typesafe UPDATE; -- from 0.0.1
 ```
 
-`EXECUTE` is revoked from `PUBLIC`. The owner (usually a superuser) can run the functions. To let an app role call them:
+`jev_version()` returns `0.2.0` (Jev API compatibility). `pg_extension.extversion` is `0.1.0`.
+
+`EXECUTE` is revoked from `PUBLIC` on both families. The owner (usually a superuser) can run the functions. To let an app role call them:
 
 ```sql
 GRANT EXECUTE ON FUNCTION typesafe_noul(text, text, text, text, text) TO app;
 GRANT EXECUTE ON FUNCTION typesafe_detect_many(text[], text, text, text, text) TO app;
+GRANT EXECUTE ON FUNCTION jev_prob(anyelement, text) TO app;
+GRANT EXECUTE ON FUNCTION jev(anyelement, text, double precision) TO app;
 ```
 
 ## API key
@@ -139,7 +150,12 @@ SELECT typesafe_noul(
 
 `SET typesafe.api_key` works for a session (superuser only) but appears in query logs.
 
-`typesafe.endpoint` must be `https://`; plain `http://` is allowed only toward
+Jev live calls resolve the key as `jev.api_key` (non-empty) then the server
+`TYPESAFE_API_KEY`. They do **not** read `typesafe.api_key` / `typesafe.api_key_file`.
+`jev.api_key` and `jev.api_url` are superuser-set; `jev.api_key` is hidden from
+`SHOW ALL` and from non-superuser `SHOW`.
+
+`typesafe.endpoint` / `jev.api_url` must be `https://`; plain `http://` is allowed only toward
 localhost (used by the test suite). Responses are capped at 8 MB. HTTP 429/529
 are retried up to 3 times per request with exponential backoff, honoring
 `Retry-After`. Requests remain cancellable (Ctrl-C, `statement_timeout`) while
@@ -193,6 +209,39 @@ In `*_many` results, `input_tokens`/`output_tokens` are per HTTP request and
 reported on each chunk's **first row only** (NULL on the rest), so
 `SUM(input_tokens)` over the result is the true total.
 
+### Native Jev row predicates
+
+These match the pg-jev 0.2.0 SQL surface. The first miss for a table + question
+starts a read-ahead, packs `jev.batch_size` rows per request, and caches answers
+for the session. Cache keys include model, URL, and credential fingerprint, so
+changing those settings is a miss.
+
+| Function | Returns | Use |
+|---|---|---|
+| `jev(rec, query [, threshold])` | boolean | `WHERE` predicate (`threshold` > `jev.threshold` > 0.5) |
+| `jev_prob(rec, query)` | float8 | probability the row matches |
+| `jev_choice(rec, query, options)` | text | classify into one option |
+| `jev_score(rec, query, levels)` | float8 | weighted level index |
+| `jev_score_norm(rec, query, levels)` | float8 | score in 0..1 |
+| `jev_confidence(rec, query, kind, options)` | float8 | choice/score confidence |
+| `jev_eval(rec, query [, kind [, options]])` | jsonb | raw answer |
+| `jev_stats()` | jsonb | session counters, including `session_bytes` / `connections` / `last_cancel_stage` |
+| `jev_cache_clear()` | void | drop session cache and jobs |
+| `jev_version()` | text | `0.2.0` |
+
+```sql
+SET jev.api_key = 'tsk_...';          -- superuser
+SET jev.api_url = 'https://api.typesafe.ai/v1/systemone';
+SELECT name FROM cities WHERE jev(cities, 'the country is Germany');
+SELECT name, jev_prob(cities, 'the country is Germany') AS p FROM cities;
+SELECT jev_choice(cities, 'which continent?', ARRAY['europe','asia','americas']) FROM cities;
+```
+
+Resource settings (`jev.batch_size`, `jev.concurrency`, `jev.max_prefetch_rows`,
+`jev.max_rows_per_statement`, `jev.max_chars_per_statement`,
+`jev.max_session_memory_kb`) are superuser-set. `jev.model`, `jev.threshold`,
+`jev.timeout`, `jev.keepalive`, and `jev.notices` are ordinary user settings.
+
 ## Tests without the network
 
 `typesafe.mock_response` short-circuits the HTTP call and returns the given
@@ -212,6 +261,17 @@ SELECT typesafe_noul('anything', 'Is this urgent?');
 ```
 
 Mock regression: `sql/typesafe.sql` / `expected/typesafe.out`.
+
+Native Jev tests use a loopback mock (`test/jev/mock_api.py`) plus
+`test/jev/sql` / `test/jev/expected` and `test/jev/run_python_suite.py`.
+`make installcheck` still runs only the legacy `typesafe` regress (`REGRESS =
+typesafe`). The bundled PG18 used for local Jev checks is built **without**
+`--enable-tap-tests`, so `t/*.pl` is not a green signal there; use
+`test/jev/run_standalone.sh` for pg_regress + Python on that tree.
+
+`jev()` returns boolean and is `STABLE PARALLEL UNSAFE` (not `STRICT`). In a
+new session the library loads on the first C call; `SELECT jev_version()` in a
+prior statement enables read-ahead for later `WHERE jev(...)` queries.
 
 ## Releasing
 

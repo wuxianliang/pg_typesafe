@@ -40,6 +40,9 @@
 #include "varatt.h"
 #endif
 
+#include "typesafe_internal.h"
+#include "typesafe_http.h"
+
 #if PG_VERSION_NUM < 150000
 #error "pg_typesafe requires PostgreSQL 15 or later"
 #endif
@@ -47,7 +50,7 @@
 #ifdef PG_MODULE_MAGIC_EXT
 PG_MODULE_MAGIC_EXT(
 					.name = "typesafe",
-					.version = "0.0.1"
+					.version = "0.1.0"
 );
 #else
 PG_MODULE_MAGIC;
@@ -68,16 +71,6 @@ PG_FUNCTION_INFO_V1(typesafe_last_request);
 PG_FUNCTION_INFO_V1(typesafe_detect_many);
 PG_FUNCTION_INFO_V1(typesafe_classify_many);
 
-#define TYPESAFE_DEFAULT_ENDPOINT \
-	"https://api.typesafe.ai/v1/systemone"
-#define TYPESAFE_DEFAULT_MODEL	"jev-latest"
-#define TYPESAFE_USER_AGENT_HDR	"User-Agent: postgres-typesafe/1.0"
-#define TYPESAFE_BODY_TRUNC		1024
-#define TYPESAFE_MAX_RETRIES		3
-#define TYPESAFE_MAX_RESPONSE_BYTES	(8 * 1024 * 1024)
-#define TYPESAFE_RETRY_MAX_WAIT_MS	60000
-#define TYPESAFE_WAIT_QUANTUM_MS	200
-
 /* GUC variables */
 static char *typesafe_api_key = NULL;
 static char *typesafe_api_key_file = NULL;
@@ -91,25 +84,12 @@ static int	typesafe_http_concurrency = 4;
 /* Last POST body, allocated in TopMemoryContext. */
 static char *last_request_json = NULL;
 
-/* PG18 replaced the postfix attribute with a prefix one */
-#ifdef pg_noreturn
-pg_noreturn static void json_shape_error(const char *detail);
-#else
-static void json_shape_error(const char *detail) pg_attribute_noreturn();
-#endif
-static char *get_text_arg(FunctionCallInfo fcinfo, int argno, const char *name);
-static Jsonb *get_jsonb_arg(FunctionCallInfo fcinfo, int argno,
-							const char *name);
 static char *resolve_model(FunctionCallInfo fcinfo, int argno);
 static const char *resolve_api_key(void);
 static void save_last_request(const char *body);
-static size_t write_callback(char *ptr, size_t size, size_t nmemb,
-							 void *userdata);
-static char *truncate_body(const char *body, int len);
-static void check_endpoint(const char *endpoint);
-static void setup_easy_handle(CURL *curl, struct curl_slist *headers,
-							  const char *payload, StringInfo response,
-							  int idx);
+static char *get_text_arg(FunctionCallInfo fcinfo, int argno, const char *name);
+static Jsonb *get_jsonb_arg(FunctionCallInfo fcinfo, int argno,
+							const char *name);
 static char **http_post_live(char **requests, int nrequests);
 static char *http_post_json(const char *request_json);
 static char *execute_request(const char *request_json);
@@ -119,12 +99,6 @@ static void append_choice_criteria(StringInfo buf, Jsonb *options);
 static void append_score_levels(StringInfo buf, ArrayType *levels);
 static char *build_classify_request(FunctionCallInfo fcinfo);
 static Jsonb *parse_response_json(const char *body);
-static bool jsonb_str_eq(const JsonbValue *v, const char *s);
-static char *jsonb_str_cstring(const JsonbValue *v);
-static float8 jsonb_numeric_float8(const JsonbValue *v);
-static int32 jsonb_numeric_int4(const JsonbValue *v);
-static JsonbContainer *jsonb_value_object_container(JsonbValue *v);
-static Jsonb *jsonb_value_object_to_jsonb(JsonbValue *v);
 static char *response_model(Jsonb *resp);
 static void extract_usage(Jsonb *resp, bool *in_isnull, int32 *in_tok,
 						  bool *out_isnull, int32 *out_tok);
@@ -246,9 +220,11 @@ _PG_init(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("could not initialize HTTP client")));
+
+	jev_startup();
 }
 
-static void
+void
 json_shape_error(const char *detail)
 {
 	ereport(ERROR,
@@ -365,169 +341,18 @@ save_last_request(const char *body)
 	last_request_json = copy;
 }
 
-static size_t
-write_callback(char *ptr, size_t size, size_t nmemb, void *userdata)
-{
-	StringInfo	buf = (StringInfo) userdata;
-	size_t		nbytes = size * nmemb;
-
-	/* Refuse to buffer absurdly large responses; curl aborts the transfer. */
-	if ((size_t) buf->len + nbytes > TYPESAFE_MAX_RESPONSE_BYTES)
-	{
-		buf->cursor = 1;		/* flag: aborted due to size cap */
-		return 0;
-	}
-
-	appendBinaryStringInfo(buf, ptr, nbytes);
-	return nbytes;
-}
-
-static char *
-truncate_body(const char *body, int len)
-{
-	if (len > TYPESAFE_BODY_TRUNC)
-		len = TYPESAFE_BODY_TRUNC;
-
-	return pnstrdup(body, len);
-}
-
-static struct curl_slist *
-append_header(struct curl_slist *headers, const char *line)
-{
-	struct curl_slist *h = curl_slist_append(headers, line);
-
-	if (h == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("out of memory")));
-
-	return h;
-}
-
 /*
- * Reject endpoints that are not https://, except plain http:// to loopback
- * hosts (used by tests).  Defense in depth for SSRF/scheme confusion.
- */
-static void
-check_endpoint(const char *endpoint)
-{
-	if (endpoint == NULL || endpoint[0] == '\0')
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("typesafe.endpoint is not set")));
-
-	if (pg_strncasecmp(endpoint, "https://", 8) == 0)
-		return;
-
-	if (pg_strncasecmp(endpoint, "http://127.0.0.1", 16) == 0 ||
-		pg_strncasecmp(endpoint, "http://localhost", 16) == 0 ||
-		pg_strncasecmp(endpoint, "http://[::1]", 12) == 0)
-		return;
-
-	ereport(ERROR,
-			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("typesafe.endpoint must use https (or http to localhost): %s",
-					endpoint)));
-}
-
-/*
- * Common per-transfer options.  idx rides in CURLOPT_PRIVATE so the multi
- * loop can map a finished handle back to its slot.
- */
-static void
-setup_easy_handle(CURL *curl, struct curl_slist *headers,
-				  const char *payload, StringInfo response, int idx)
-{
-	if (curl_easy_setopt(curl, CURLOPT_URL, typesafe_endpoint) != CURLE_OK ||
-		curl_easy_setopt(curl, CURLOPT_POST, 1L) != CURLE_OK ||
-		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers) != CURLE_OK ||
-		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload) != CURLE_OK ||
-		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
-						 (long) strlen(payload)) != CURLE_OK ||
-		curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
-						 (long) typesafe_timeout_ms) != CURLE_OK ||
-		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L) != CURLE_OK ||
-		curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) != CURLE_OK ||
-		curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L) != CURLE_OK ||
-		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L) != CURLE_OK ||
-		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L) != CURLE_OK ||
-#if LIBCURL_VERSION_NUM >= 0x075500	/* 7.85.0 */
-		curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https") != CURLE_OK ||
-#else
-		curl_easy_setopt(curl, CURLOPT_PROTOCOLS,
-						 CURLPROTO_HTTP | CURLPROTO_HTTPS) != CURLE_OK ||
-#endif
-		curl_easy_setopt(curl, CURLOPT_HTTP_VERSION,
-						 (long) CURL_HTTP_VERSION_2TLS) != CURLE_OK ||
-		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
-						 (curl_write_callback) write_callback) != CURLE_OK ||
-		curl_easy_setopt(curl, CURLOPT_WRITEDATA, response) != CURLE_OK ||
-		curl_easy_setopt(curl, CURLOPT_PRIVATE,
-						 (char *) (intptr_t) idx) != CURLE_OK)
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("could not configure HTTP client")));
-}
-
-/*
- * Backoff before retry attempt 'attempt' (1-based), honoring the server's
- * Retry-After when libcurl exposes it.  Milliseconds, capped.
- */
-static long
-retry_delay_ms(CURL *eh, int attempt)
-{
-	long		delay = 200L * (1L << (attempt - 1));
-
-#if LIBCURL_VERSION_NUM >= 0x074200	/* 7.66.0: CURLINFO_RETRY_AFTER (enum, not #ifdef-able) */
-	{
-		curl_off_t	ra = 0;
-
-		if (curl_easy_getinfo(eh, CURLINFO_RETRY_AFTER, &ra) == CURLE_OK &&
-			ra > 0)
-		{
-			if (ra > TYPESAFE_RETRY_MAX_WAIT_MS / 1000)
-				ra = TYPESAFE_RETRY_MAX_WAIT_MS / 1000;
-			if (ra * 1000 > delay)
-				delay = (long) ra * 1000;
-		}
-	}
-#endif
-
-	if (delay > TYPESAFE_RETRY_MAX_WAIT_MS)
-		delay = TYPESAFE_RETRY_MAX_WAIT_MS;
-	return delay;
-}
-
-/* Per-slot transfer state for http_post_live. */
-typedef enum
-{
-	TS_SLOT_PENDING,			/* not yet started (or waiting on retry) */
-	TS_SLOT_IN_FLIGHT,
-	TS_SLOT_DONE
-} ts_slot_state;
-
-/*
- * POST nrequests bodies to typesafe.endpoint via curl_multi, at most
- * typesafe.http_concurrency in flight.  Retries HTTP 429/529 per handle
- * without stalling other transfers, stays responsive to query cancel
- * (CHECK_FOR_INTERRUPTS between waits, latch-based sleeps), and never
- * logs the API key.  Returns palloc'd response bodies in request order.
+ * POST nrequests bodies to typesafe.endpoint via the shared curl_multi
+ * transport.  Legacy family: three 429/529 retries, HTTP/2 preference,
+ * truncated body in errors, and typesafe.endpoint URL policy.
  */
 static char **
 http_post_live(char **requests, int nrequests)
 {
 	char	  **results;
-	CURLM	   *volatile multi = NULL;
-	struct curl_slist *volatile headers = NULL;
-	CURL	  **volatile easies = NULL;
-	StringInfoData *responses;
-	const char **payloads;
-	int		   *attempts;
-	TimestampTz *retry_at;
-	ts_slot_state *slots;
-	int			concurrency;
-	int			in_flight = 0;
-	int			ndone = 0;
+	TsHttpSession *session;
+	TsHttpPolicy pol;
+	TsHttpRequest **reqs;
 	const char *apikey;
 	int			i;
 
@@ -535,224 +360,41 @@ http_post_live(char **requests, int nrequests)
 	if (nrequests <= 0)
 		return results;
 
-	check_endpoint(typesafe_endpoint);
 	apikey = resolve_api_key();
+	memset(&pol, 0, sizeof(pol));
+	pol.endpoint = typesafe_endpoint;
+	pol.credential = apikey;
+	pol.guc_name = "typesafe.endpoint";
+	pol.user_agent = TYPESAFE_USER_AGENT_HDR;
+	pol.timeout_ms = typesafe_timeout_ms;
+	pol.max_attempts = 1 + TYPESAFE_MAX_RETRIES;
+	pol.retry_5xx = false;
+	pol.http11 = false;
+	pol.keepalive_s = 0;
+	pol.concurrency = typesafe_http_concurrency;
+	if (pol.concurrency > nrequests)
+		pol.concurrency = nrequests;
+	if (pol.concurrency < 1)
+		pol.concurrency = 1;
+	pol.max_response = TYPESAFE_MAX_RESPONSE_BYTES;
+	pol.family = TS_FAMILY_LEGACY;
+	pol.require_asynch_dns = false;
+	pol.owner_generation = 0;
 
-	concurrency = typesafe_http_concurrency;
-	if (concurrency > nrequests)
-		concurrency = nrequests;
-
-	easies = (CURL **) palloc0(sizeof(CURL *) * nrequests);
-	responses = (StringInfoData *) palloc(sizeof(StringInfoData) * nrequests);
-	payloads = (const char **) palloc(sizeof(char *) * nrequests);
-	attempts = (int *) palloc0(sizeof(int) * nrequests);
-	retry_at = (TimestampTz *) palloc0(sizeof(TimestampTz) * nrequests);
-	slots = (ts_slot_state *) palloc0(sizeof(ts_slot_state) * nrequests);
-
-	for (i = 0; i < nrequests; i++)
-	{
-		initStringInfo(&responses[i]);
-		payloads[i] = pg_server_to_any(requests[i], strlen(requests[i]),
-									   PG_UTF8);
-	}
-
-	multi = curl_multi_init();
-	if (multi == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("could not initialize HTTP client")));
-
+	session = ts_http_session_create(CurrentMemoryContext);
+	reqs = (TsHttpRequest **) palloc(sizeof(TsHttpRequest *) * nrequests);
 	PG_TRY();
 	{
-		char	   *auth;
-
-		headers = append_header(NULL, "Content-Type: application/json");
-		headers = append_header(headers, "Accept: application/json");
-		headers = append_header(headers, TYPESAFE_USER_AGENT_HDR);
-		/* suppress libcurl's Expect: 100-continue round trip */
-		headers = append_header(headers, "Expect:");
-
-		auth = psprintf("Authorization: Bearer %s", apikey);
-		headers = append_header(headers, auth);
-		pfree(auth);
-
-		while (ndone < nrequests)
-		{
-			TimestampTz now;
-			int			still_running = 0;
-			CURLMsg    *msg;
-			int			left;
-			bool		waiting_retry = false;
-			long		sleep_ms;
-
-			CHECK_FOR_INTERRUPTS();
-
-			now = GetCurrentTimestamp();
-
-			/* Launch pending slots whose retry deadline (if any) passed. */
-			for (i = 0; i < nrequests && in_flight < concurrency; i++)
-			{
-				if (slots[i] != TS_SLOT_PENDING)
-					continue;
-				if (retry_at[i] != 0 && retry_at[i] > now)
-					continue;
-
-				if (easies[i] == NULL)
-				{
-					easies[i] = curl_easy_init();
-					if (easies[i] == NULL)
-						ereport(ERROR,
-								(errcode(ERRCODE_CONNECTION_FAILURE),
-								 errmsg("could not initialize HTTP client")));
-					setup_easy_handle(easies[i], headers, payloads[i],
-									  &responses[i], i);
-				}
-
-				resetStringInfo(&responses[i]);
-				responses[i].cursor = 0;	/* clear size-cap abort flag */
-				if (curl_multi_add_handle(multi, easies[i]) != CURLM_OK)
-					ereport(ERROR,
-							(errcode(ERRCODE_CONNECTION_FAILURE),
-							 errmsg("could not start HTTP request")));
-				slots[i] = TS_SLOT_IN_FLIGHT;
-				in_flight++;
-			}
-
-			if (curl_multi_perform(multi, &still_running) != CURLM_OK)
-				ereport(ERROR,
-						(errcode(ERRCODE_CONNECTION_FAILURE),
-						 errmsg("typesafe HTTP request failed")));
-
-			while ((msg = curl_multi_info_read(multi, &left)) != NULL)
-			{
-				int			idx;
-				char	   *priv = NULL;
-				long		status = 0;
-				CURL	   *eh;
-
-				if (msg->msg != CURLMSG_DONE)
-					continue;
-
-				eh = msg->easy_handle;
-				curl_easy_getinfo(eh, CURLINFO_PRIVATE, &priv);
-				idx = (int) (intptr_t) priv;
-
-				if (msg->data.result != CURLE_OK)
-				{
-					if (msg->data.result == CURLE_WRITE_ERROR &&
-						responses[idx].cursor == 1)
-						ereport(ERROR,
-								(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-								 errmsg("typesafe HTTP response exceeds %d bytes",
-										TYPESAFE_MAX_RESPONSE_BYTES)));
-					ereport(ERROR,
-							(errcode(ERRCODE_CONNECTION_FAILURE),
-							 errmsg("typesafe HTTP request failed: %s",
-									curl_easy_strerror(msg->data.result))));
-				}
-
-				curl_easy_getinfo(eh, CURLINFO_RESPONSE_CODE, &status);
-				curl_multi_remove_handle(multi, eh);
-				in_flight--;
-
-				if (status == 200)
-				{
-					char	   *converted;
-
-					converted = pg_any_to_server(responses[idx].data,
-												 responses[idx].len,
-												 PG_UTF8);
-					if (converted == responses[idx].data)
-						converted = pstrdup(responses[idx].data);
-					results[idx] = converted;
-					curl_easy_cleanup(eh);
-					easies[idx] = NULL;
-					slots[idx] = TS_SLOT_DONE;
-					ndone++;
-					continue;
-				}
-
-				if ((status == 429 || status == 529) &&
-					attempts[idx] < TYPESAFE_MAX_RETRIES)
-				{
-					long		delay;
-
-					attempts[idx]++;
-					delay = retry_delay_ms(eh, attempts[idx]);
-					retry_at[idx] =
-						TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
-													delay);
-					slots[idx] = TS_SLOT_PENDING;
-					continue;
-				}
-
-				ereport(ERROR,
-						(errcode(ERRCODE_CONNECTION_FAILURE),
-						 errmsg("typesafe HTTP request failed with status %ld",
-								status),
-						 errdetail("Response body (truncated): %s",
-								   truncate_body(responses[idx].data,
-												 responses[idx].len))));
-			}
-
-			if (ndone >= nrequests)
-				break;
-
-			/* Anything parked on a retry deadline? */
-			sleep_ms = TYPESAFE_WAIT_QUANTUM_MS;
-			now = GetCurrentTimestamp();
-			for (i = 0; i < nrequests; i++)
-			{
-				if (slots[i] == TS_SLOT_PENDING && retry_at[i] != 0)
-				{
-					long		ms;
-
-					waiting_retry = true;
-					ms = (long) ((retry_at[i] - now) / 1000);
-					if (ms < 1)
-						ms = 1;
-					if (ms < sleep_ms)
-						sleep_ms = ms;
-				}
-			}
-
-			if (in_flight > 0)
-			{
-				int			numfds = 0;
-
-				/*
-				 * Short quantum keeps us responsive to cancel even though
-				 * curl_multi_wait does not watch the process latch.
-				 */
-				curl_multi_wait(multi, NULL, 0, (int) sleep_ms, &numfds);
-			}
-			else if (waiting_retry)
-			{
-				(void) WaitLatch(MyLatch,
-								 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-								 sleep_ms,
-								 PG_WAIT_EXTENSION);
-				ResetLatch(MyLatch);
-			}
-		}
+		for (i = 0; i < nrequests; i++)
+			reqs[i] = ts_http_submit(session, &pol, requests[i], 0);
+		for (i = 0; i < nrequests; i++)
+			ts_http_await(session, reqs[i]);
+		for (i = 0; i < nrequests; i++)
+			results[i] = pstrdup(reqs[i]->result_body ? reqs[i]->result_body : "");
 	}
 	PG_FINALLY();
 	{
-		if (multi != NULL)
-		{
-			for (i = 0; i < nrequests; i++)
-			{
-				if (easies != NULL && easies[i] != NULL)
-				{
-					curl_multi_remove_handle(multi, easies[i]);
-					curl_easy_cleanup(easies[i]);
-					easies[i] = NULL;
-				}
-			}
-			curl_multi_cleanup(multi);
-		}
-		if (headers != NULL)
-			curl_slist_free_all(headers);
+		ts_http_session_destroy(session);
 	}
 	PG_END_TRY();
 
@@ -955,7 +597,7 @@ parse_response_json(const char *body)
 	return jb;
 }
 
-static bool
+bool
 jsonb_str_eq(const JsonbValue *v, const char *s)
 {
 	int			len;
@@ -968,13 +610,13 @@ jsonb_str_eq(const JsonbValue *v, const char *s)
 		memcmp(v->val.string.val, s, len) == 0;
 }
 
-static char *
+char *
 jsonb_str_cstring(const JsonbValue *v)
 {
 	return pnstrdup(v->val.string.val, v->val.string.len);
 }
 
-static float8
+float8
 jsonb_numeric_float8(const JsonbValue *v)
 {
 	char	   *s;
@@ -986,7 +628,7 @@ jsonb_numeric_float8(const JsonbValue *v)
 	return DatumGetFloat8(d);
 }
 
-static int32
+int32
 jsonb_numeric_int4(const JsonbValue *v)
 {
 	char	   *s;
@@ -998,7 +640,7 @@ jsonb_numeric_int4(const JsonbValue *v)
 	return DatumGetInt32(d);
 }
 
-static JsonbContainer *
+JsonbContainer *
 jsonb_value_object_container(JsonbValue *v)
 {
 	if (v == NULL)
@@ -1021,7 +663,7 @@ jsonb_value_object_container(JsonbValue *v)
 	return NULL;
 }
 
-static Jsonb *
+Jsonb *
 jsonb_value_object_to_jsonb(JsonbValue *v)
 {
 	Jsonb	   *jb;

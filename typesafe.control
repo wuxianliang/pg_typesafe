@@ -1,5 +1,5 @@
 # typesafe extension
-comment = 'TypeSafe AI client for categorical classification'
-default_version = '0.0.1'
+comment = 'TypeSafe AI client and native Jev row predicates'
+default_version = '0.1.0'
 module_pathname = '$libdir/typesafe'
 relocatable = true

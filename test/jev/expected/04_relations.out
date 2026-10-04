@@ -1,0 +1,141 @@
+CREATE EXTENSION IF NOT EXISTS typesafe;
+NOTICE:  extension "typesafe" already exists, skipping
+SELECT current_setting('server_version') AS server_version;
+ server_version 
+----------------
+ 18.4
+(1 row)
+
+\set ECHO none
+SELECT jev_version();
+ jev_version 
+-------------
+ 0.2.0
+(1 row)
+
+CREATE EXTENSION postgres_fdw;
+CREATE TABLE jev_heap (id int PRIMARY KEY, name text);
+INSERT INTO jev_heap VALUES (1,'Berlin'),(2,'Tokyo');
+CREATE MATERIALIZED VIEW jev_mv AS SELECT * FROM jev_heap;
+CREATE VIEW jev_v AS SELECT * FROM jev_heap;
+CREATE TABLE jev_part (id int, name text) PARTITION BY RANGE (id);
+CREATE TABLE jev_part_a PARTITION OF jev_part FOR VALUES FROM (0) TO (10);
+INSERT INTO jev_part VALUES (1,'Berlin'),(2,'Tokyo');
+CREATE SERVER jev_loopback FOREIGN DATA WRAPPER postgres_fdw
+  OPTIONS (host '127.0.0.1', port :'FDW_PORT', dbname 'jev_fdw_remote');
+CREATE USER MAPPING FOR CURRENT_USER SERVER jev_loopback
+  OPTIONS (user :'USER', password_required 'false');
+CREATE FOREIGN TABLE jev_ft (id int, name text)
+  SERVER jev_loopback OPTIONS (schema_name 'public', table_name 'jev_remote');
+CREATE TABLE jev_rls (id int, name text, owner name);
+INSERT INTO jev_rls VALUES (1,'Berlin','jev_rls_role'),(2,'secret','no_one');
+ALTER TABLE jev_rls ENABLE ROW LEVEL SECURITY;
+CREATE POLICY jev_rls_p ON jev_rls FOR SELECT USING (owner = CURRENT_USER);
+CREATE ROLE jev_rls_role LOGIN;
+GRANT USAGE ON SCHEMA public TO jev_rls_role;
+GRANT SELECT ON jev_rls TO jev_rls_role;
+GRANT EXECUTE ON FUNCTION jev_prob(anyelement, text) TO jev_rls_role;
+-- 调用矩阵：mock last-word = Tokyo → 0.9，否则 0.1
+SELECT name, jev_prob(jev_heap, 'the name is Tokyo') AS p FROM jev_heap ORDER BY id;
+  name  |  p  
+--------+-----
+ Berlin | 0.1
+ Tokyo  | 0.9
+(2 rows)
+
+SELECT name, jev_prob(jev_mv,   'the name is Tokyo') AS p FROM jev_mv   ORDER BY id;
+  name  |  p  
+--------+-----
+ Berlin | 0.1
+ Tokyo  | 0.9
+(2 rows)
+
+SELECT name, jev_prob(jev_v,    'the name is Tokyo') AS p FROM jev_v    ORDER BY id;
+  name  |  p  
+--------+-----
+ Berlin | 0.1
+ Tokyo  | 0.9
+(2 rows)
+
+SELECT name, jev_prob(jev_part, 'the name is Tokyo') AS p FROM jev_part ORDER BY id;
+  name  |  p  
+--------+-----
+ Berlin | 0.1
+ Tokyo  | 0.9
+(2 rows)
+
+SELECT name, jev_prob(jev_ft,   'the name is Tokyo') AS p FROM jev_ft   ORDER BY id;
+  name  |  p  
+--------+-----
+ Berlin | 0.1
+ Tokyo  | 0.9
+(2 rows)
+
+SELECT s.name, jev_prob(s, 'the name is Tokyo') AS p
+  FROM (SELECT name FROM jev_heap) s ORDER BY 1;
+  name  |  p  
+--------+-----
+ Berlin | 0.1
+ Tokyo  | 0.9
+(2 rows)
+
+SET ROLE jev_rls_role;
+SELECT name, jev_prob(jev_rls, 'the name is Tokyo') AS p FROM jev_rls ORDER BY id;
+  name  |  p  
+--------+-----
+ Berlin | 0.1
+(1 row)
+
+RESET ROLE;
+-- U1：named composite / relkind 'c'，内部扫描入口必须 0A000
+CREATE TYPE jev_u1_comp AS (id int, name text);
+DO $$
+DECLARE
+  st text;
+  msg text;
+BEGIN
+  BEGIN
+    PERFORM jev_prob(ROW(1,'Berlin')::jev_u1_comp, 'the name is Tokyo');
+    RAISE EXCEPTION 'U1 expected 0A000, query succeeded';
+  EXCEPTION
+    WHEN feature_not_supported THEN
+      GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE, msg = MESSAGE_TEXT;
+      IF st IS DISTINCT FROM '0A000' THEN
+        RAISE EXCEPTION 'U1 expected SQLSTATE 0A000, got %', st;
+      END IF;
+      IF position('relkind' in lower(msg)) = 0 THEN
+        RAISE EXCEPTION 'U1 message must mention relkind: %', msg;
+      END IF;
+    WHEN OTHERS THEN
+      GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE, msg = MESSAGE_TEXT;
+      RAISE EXCEPTION 'U1 expected 0A000, got % %', st, msg;
+  END;
+END $$;
+CREATE SEQUENCE jev_seq;
+-- Sequence whole-row has reltype=0; PostgreSQL rejects 42809 in
+-- makeWholeRowVar before jev. Do not mint 0A000. Unsupported relkind
+-- that reaches jev is U1 (composite 'c').
+DO $$
+DECLARE
+  st text;
+BEGIN
+  BEGIN
+    PERFORM jev_prob(s, 'the name is Tokyo') FROM jev_seq s;
+    RAISE EXCEPTION 'U1-S expected core 42809, query succeeded';
+  EXCEPTION
+    WHEN wrong_object_type THEN
+      GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE;
+      IF st IS DISTINCT FROM '42809' THEN
+        RAISE EXCEPTION 'U1-S expected SQLSTATE 42809, got %', st;
+      END IF;
+    WHEN feature_not_supported THEN
+      RAISE EXCEPTION 'U1-S must not rewrite core 42809 into 0A000';
+    WHEN OTHERS THEN
+      GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE;
+      RAISE EXCEPTION 'U1-S expected 42809, got %', st;
+  END;
+END $$;
+DROP FOREIGN TABLE IF EXISTS jev_ft;
+DROP USER MAPPING IF EXISTS FOR CURRENT_USER SERVER jev_loopback;
+DROP SERVER IF EXISTS jev_loopback;
+DROP EXTENSION IF EXISTS postgres_fdw;
